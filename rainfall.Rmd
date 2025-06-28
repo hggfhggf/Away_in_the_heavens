@@ -1,0 +1,861 @@
+---
+title: "Rainfall"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+  
+# Introduction  {.tabset .tabset-fade .tabset-pills}
+
+The goal of this competition is to predict rainfall for each day of the year.
+
+My notebook serves as a demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.
+
+Lets dive right in.
+
+The Kaggle kernels have many of the common r packages built in.  
+
+## Load libraries
+
+```{r }
+#| label: setup
+#| warning: false
+#| message: false
+
+if (dir.exists("/kaggle")){
+  path <- "/kaggle/input/playground-series-s5e3/"
+
+# options(repos = c(CRAN = "https://packagemanager.posit.co/cran/__linux__/focal/2021-05-17"))
+# install.packages("ranger", quiet = TRUE)
+    
+options(repos = c(CRAN = "https://packagemanager.posit.co/cran/2021-03-22"))
+remotes::install_github("tidymodels/plsmod", quiet = TRUE)    
+#remotes::install_github("mayer79/outForest", quiet = TRUE)    
+#remotes::install_github("tidyverts/fable.binary", quiet = TRUE)
+    
+cores <- future::availableCores()
+
+} else {
+  path <- stringr::str_c(here::here("data"),"/")
+  orig_path <- stringr::str_c(here::here("data"),"/")
+
+  cores <- future::availableCores(omit = 2)
+}
+ 
+suppressPackageStartupMessages({
+library(tidyverse, quietly = TRUE) # metapackage of all tidyverse packages
+library(tidymodels) # metapackage see https://www.tidymodels.org/
+
+library(correlationfunnel)    
+   
+library(plsmod)
+library(discrim)
+
+library(DALEXtra) # Tidymodels Explainability         
+    
+library(brulee)   # interface to torch
+library(stacks)   # model ensembling
+
+})
+
+tidymodels_prefer()
+conflicted::conflicts_prefer(brulee::coef)
+
+options(tidymodels.dark = TRUE)
+
+theme_set(ggdark::dark_theme_minimal())
+
+```
+
+## Load Data
+
+
+```{r }
+#| label: load data
+#| warning: false
+#| message: false
+
+preprocessor <- function(dataframe) {
+
+dataframe <- dataframe %>%
+    janitor::clean_names() |>
+
+    mutate(year = id %/% 365 ,
+           day = id - year * 365 ) |> 
+    
+    group_by(day) |> 
+    mutate(across(c(temparature), \(x) (mean(x, na.rm = TRUE) - x)/sd(x, na.rm = TRUE),  .names = "delta_day_{.col}")) |>
+    ungroup() |>
+
+    mutate(across(starts_with("delta_day_"), \(x) if_else(is.na(x),0,x))) |>    
+
+    group_by(cloud) |> 
+    mutate(across(c(temparature, sunshine), \(x) (mean(x, na.rm = TRUE) - x)/sd(x, na.rm = TRUE),  .names = "delta_cloud_{.col}")) |>
+    ungroup() |>
+
+    mutate(across(starts_with("delta_cloud_"), \(x) if_else(is.na(x),0,x))) |>    
+  
+   group_by(sunshine) |> 
+   mutate(across(c(dewpoint), \(x) (mean(x, na.rm = TRUE) - x)/sd(x, na.rm = TRUE),  .names = "delta_sunshine_{.col}")) |>
+    ungroup() |>
+
+    mutate(across(starts_with("delta_sunshine_"), \(x) if_else(is.na(x),0,x))) |>    
+  
+  
+    group_by(pressure) |> 
+    mutate(across(c(dewpoint), \(x) (mean(x, na.rm = TRUE) - x)/sd(x, na.rm = TRUE),  .names = "delta_pressure_{.col}")) |>
+    ungroup() |>
+
+    mutate(across(starts_with("delta_pressure_"), \(x) if_else(is.na(x),0,x))) |>   
+  
+#    group_by(temparature) |> 
+#    mutate(across(c(mintemp, humidity), \(x) (mean(x, na.rm = TRUE) - x)/sd(x, na.rm = TRUE),  .names = "delta_temp_{.col}")) |>
+#    ungroup() |>
+
+#    mutate(across(starts_with("delta_temp_"), \(x) if_else(is.na(x),0,x))) |>   
+  
+#    group_by(dewpoint) |> 
+#    mutate(across(c(maxtemp, mintemp, temparature, cloud, sunshine), \(x) (mean(x, na.rm = TRUE) - x)/sd(x, na.rm = TRUE),  .names = "delta_dewpoint_{.col}")) |>
+#    ungroup() |>
+
+#    mutate(across(starts_with("delta_dewpoint_"), \(x) if_else(is.na(x),0,x))) |>   
+    
+ #   group_by(humidity) |> 
+ #   mutate(across(c(maxtemp, temparature, cloud, sunshine), \(x) (mean(x, na.rm = TRUE) - x)/sd(x, na.rm = TRUE),  .names = "delta_humidity_{.col}")) |>
+ #   ungroup() |>
+
+#    mutate(across(starts_with("delta_humidity_"), \(x) if_else(is.na(x),0,x))) |>   
+  
+#    mutate(winddirection = factor(winddirection %/% 20)) |> 
+
+    mutate(across(c(where(is.character)), \(x) as.factor(x))) 
+
+return(dataframe)
+}
+
+raw_df <- read_csv(str_c(path, "train.csv"),
+                   show_col_types = FALSE) |> 
+          mutate(rainfall= as.character(rainfall)) |> 
+          preprocessor() 
+
+tst_df <- read_csv(str_c(path, "test.csv"),
+                   show_col_types = FALSE)  |>  
+  preprocessor() 
+
+# because we already know the test set, let's remove the train set factor levels that do not correspond with anything on the test set
+for (col in names(raw_df)) {
+    if (is.factor(raw_df[[col]]) & col != "rainfall") {
+      # Get levels in train and test dataframes
+      raw_levels <- levels(raw_df[[col]])
+      tst_levels <- levels(tst_df[[col]])
+      
+      # Identify levels in train not in test
+      new_levels <- setdiff(raw_levels, tst_levels)
+      
+      # Set these levels to NA in train dataframe
+      raw_df[[col]] <- factor(raw_df[[col]], levels = c(tst_levels, new_levels))
+      raw_df[[col]][raw_df[[col]] %in% new_levels] <- NA_character_
+    }
+  }
+
+# the synthetic playground competitions seem to perform better when numerics are also included as factors
+all_df <-
+    bind_rows(raw_df %>% mutate(source = "train"),
+              tst_df %>% mutate(source = "test")) 
+
+
+train_df <- all_df %>% 
+  filter(source == "train") %>% 
+  select(-source) 
+
+competition_df <- all_df %>% 
+  filter(source == "test") %>% 
+  select(-source, -rainfall)
+
+
+```
+
+
+# EDA {.tabset .tabset-fade .tabset-pills}
+
+## Features
+
+```{r}
+#| label: Features
+#| warning: false
+#| message: false
+#| fig.width: 6
+
+
+features <- train_df %>%
+  select(-id, -rainfall, -year, -day, -windspeed, -dewpoint) |> 
+  names()
+
+train_df <- train_df %>% 
+  distinct(pick(all_of(features)), .keep_all = TRUE)
+
+nom_features <- train_df %>%
+  select(all_of(features)) %>%
+  select(where(is.character), where(is.factor)) %>%
+  names() 
+
+logical_features <- train_df %>%
+  select(all_of(features)) %>%
+  select(where(is.logical)) %>%
+  names() 
+
+num_features <- train_df %>%
+  select(all_of(features)) %>%
+  select(where(is.numeric)) %>%
+  names()
+```
+
+Nominal features:
+
+`r nom_features`
+
+Numeric features: 
+
+`r num_features`
+
+Logical features: 
+
+`r logical_features`
+
+
+Size of the combined train and competition datasets:
+
+`r nrow(all_df)`
+
+Size of the split made available to machine learning
+
+`r nrow(train_df)`
+
+
+
+## Numeric features
+
+```{r}
+#| label: numeric
+#| warning: false
+#| message: false
+#| fig.height: 16
+#| fig.width: 6
+
+train_df %>% 
+  select(all_of(num_features), rainfall) %>% 
+  pivot_longer(-rainfall,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(value)) +
+  geom_histogram(aes(fill = rainfall), position = "identity", bins = 30) +
+  geom_freqpoly(aes(linetype = rainfall), bins = 30) +
+  geom_rug(aes(color = rainfall)) +
+  facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  guides(color = "none") +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.title.position = "plot") +
+  labs(color = NULL, 
+       title = "Numeric Feature Univariate Distributions",
+       caption = "Data: Kaggle.com | Visual: Jim Gruman")
+
+train_df %>% 
+  select(all_of(num_features), rainfall, day) %>% 
+  pivot_longer(-c(rainfall,day),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(day, value, color = rainfall)) +
+  geom_point(show.legend = FALSE, shape = 20) +
+   facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.title.position = "plot") +
+  labs(color = NULL, fill = "Rainfall",
+       title = "Numeric Feature by Day",
+       caption = "Data: Kaggle.com | Visual: Jim Gruman")
+
+```
+
+## Nominal features
+
+Explore the distribution of outcome class by factor level.
+
+
+```{r}
+#| label: nominal
+#| warning: false
+#| message: false
+#| fig.height: 24
+#| fig.width: 12
+
+
+if(length(nom_features) >0){
+
+train_df %>% 
+  select(all_of(nom_features), rainfall) %>% 
+  mutate(across(nom_features, fct_lump_n,n = 10, other_level = 'other')) %>%
+
+  pivot_longer(-rainfall,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+    
+  summarise(n = n(),
+            .by = c(rainfall, metric, value)) %>%
+
+  mutate(value = tidytext::reorder_within(value, n, metric)) %>%
+    
+  ggplot(aes(x = n, y = value, fill = rainfall)) +
+  geom_col() +
+
+  tidytext::scale_y_reordered() +
+  scale_x_continuous(n.breaks = 3, guide = guide_axis(n.dodge = 2))  +
+  facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+       legend.position = "bottom") +
+  labs(title = "Nominal Feature Counts",
+       fill = NULL,
+       caption = "Data: Kaggle | Visual: Jim Gruman")
+  
+
+
+train_df %>% 
+  select(all_of(nom_features), rainfall) %>% 
+  mutate(across(nom_features, fct_lump_n,n = 10, other_level = 'other')) %>%
+
+  pivot_longer(-rainfall,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+    
+  summarise(n = n(),
+            .by = c(rainfall, metric, value)) %>%
+
+  mutate(value = tidytext::reorder_within(value, n, metric)) %>%
+    
+  ggplot(aes(x = n, y = value, fill = rainfall)) +
+  geom_col(position = "fill") +
+
+  tidytext::scale_y_reordered() +
+  scale_x_continuous(n.breaks = 3, guide = guide_axis(n.dodge = 2))  +
+  facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+       legend.position = "bottom") +
+  labs(title = "Proportion of Outcome in Nominal Feature Counts",
+       fill = NULL,
+       caption = "Data: Kaggle | Visual: Jim Gruman")
+
+}    
+```
+
+
+## Counts of Missingness
+
+The test set is missing one wind direction. We will fill it in with the median of all of the data.
+                  
+```{r}
+#| label: counts of missingness
+
+train_df %>% 
+  summarize(across(all_of(features), function(x) sum(is.na(x)))) %>% 
+  pivot_longer(everything(),
+              names_to = "feature",
+              values_to = "Count of Missing") %>% 
+                   knitr::kable()
+
+competition_df %>% 
+  summarize(across(all_of(features), function(x) sum(is.na(x)))) %>% 
+  pivot_longer(everything(),
+              names_to = "feature",
+              values_to = "Count of Missing") %>% 
+                   knitr::kable()
+
+competition_df <- competition_df %>% 
+  mutate(across(where(is.numeric), ~replace_na(., median(., na.rm=TRUE))))          
+
+```
+
+## Counts of Distinct
+                   
+               
+```{r}
+#| label: counts of distinct
+               
+train_df %>%
+  summarize(across(all_of(features), n_distinct)) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "Count of distinct train") |>
+  left_join(
+    competition_df %>%
+      summarize(across(all_of(features), n_distinct)) %>%
+      pivot_longer(everything(), names_to = "feature", values_to = "Count of distinct test"),
+    by = join_by(feature)
+  ) %>% 
+                   knitr::kable()
+               
+```
+
+## Duplicated
+
+Is this competition transaction already in the training data with a correct rainfall?
+
+```{r}
+#| label: duplicates
+#| warning: false
+#| message: false
+
+bind_rows(train_df %>% mutate(source = "train"),
+              competition_df %>% mutate(rainfall= NA_character_, source = "test")) |> 
+    group_by_at(features) %>%
+    mutate(num_dups = n(),
+           dup_id = row_number()) %>% 
+    ungroup() %>%
+    group_by(source) %>%
+    mutate(is_duplicated = dup_id > 1) %>% 
+    count(is_duplicated) %>% 
+                   knitr::kable()
+               
+
+```
+
+## Pairwise Correlations
+                   
+`ggcorrplot` provides a quick look at numeric features where the correlation may be significant. 
+
+```{r}
+#| label: pairwise correlations
+#| fig.width: 12
+#| fig.height: 12                   
+                   
+train_df %>% 
+  select(all_of(num_features), rainfall) %>%
+  mutate(rainfall = as.numeric(rainfall) -1) |> 
+  ggcorrplot::cor_pmat() %>% 
+  ggcorrplot::ggcorrplot(hc.order = TRUE, lab = TRUE,
+    type = "lower", insig = "blank") +
+  labs(title = "Pairwise Correlations Training Set")
+                   
+competition_df %>% 
+  select(all_of(num_features)) %>% 
+  ggcorrplot::cor_pmat() %>% 
+  ggcorrplot::ggcorrplot(hc.order = TRUE, lab = TRUE,
+    type = "lower", insig = "blank") +
+  labs(title = "Pairwise Correlations Competition Set")
+
+``` 
+
+## Correlation Funnel
+
+rainfall, cloud, and sunshine are going to drive this model. 
+
+sunshine and humidity, normalized on day, also will contribute.
+
+```{r}
+#| label: correlation funnel 
+#| warning: false
+#| message: false
+#| fig.width: 6
+#| fig.height: 12
+
+rainfall_df <- as_tibble(train_df$rainfall)
+
+train_df %>% 
+  select(all_of(features)) %>% 
+    binarize(one_hot = TRUE) %>%
+    bind_cols(rainfall_df) |> 
+    mutate(value = as.numeric(value) -1) |> 
+    rename(rainfall = value) |> 
+    correlate(target = rainfall ) %>% 
+    plot_correlation_funnel()
+
+```                   
+               
+
+## Target
+
+```{r}
+#| label: outcome 
+#| warning: false
+#| message: false
+#| fig.width: 6
+
+
+train_df %>%
+  summarize(outcome_sum = n(), .by = rainfall) %>%
+  arrange(-outcome_sum) %>%
+  mutate(prop = outcome_sum / nrow(train_df)) %>%
+  mutate(ypos = cumsum(prop) - 0.5 * prop) %>%
+  ggplot(aes(x = "", y = prop, fill = rainfall)) +
+  geom_bar(stat = "identity",
+           width = 1,
+           show.legend = FALSE) +
+  geom_text(
+    aes(
+      y = ypos,
+      label= paste0(rainfall
+                     , "\n", round(prop, 2) * 100, "%")
+    ),
+    color = "white",
+    nudge_x = 0,
+    size = 3
+  ) +
+  coord_polar("y", start = 0) +
+  theme(
+    axis.text = element_blank(),
+    axis.title = element_blank()  ) +
+  labs(title = "Rainfall", caption = "Data: Kaggle.com | Visual: Jim Gruman")
+
+```                            
+           
+                
+# Machine Learning {.tabset .tabset-fade .tabset-pills}
+
+## Recipe
+
+```{r}
+#| label: recipe
+
+base_rec <- recipe(
+    
+    formula(paste0("rainfall ~ ", 
+               str_c(features,  collapse = " + "))),
+    data = train_df
+  ) %>%     
+                   
+  step_mutate(cloud_o_sunshine = cloud / (sunshine + 1)) |>          # keep
+#  step_mutate(humidity_o_dewpoint = humidity / (dewpoint + 1)) |>    
+
+#  step_interact(~ humidity:sunshine) |>          
+#  step_interact(~ cloud:sunshine) |>             
+  step_interact(~ maxtemp:sunshine) |>             # keep
+#  step_interact(~ temparature:humidity) |>         
+  
+
+  step_impute_mode(all_nominal_predictors()) |>                    
+  step_dummy(all_nominal_predictors()) |>     
+
+  step_lag(mintemp, cloud) |>                    # keep
+
+  step_impute_median(all_predictors()) |>                       
+                   
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors()) 
+ # themis::step_upsample(rainfall,over_ratio = 1)               
+
+
+folds <- rsample::sliding_period(
+  train_df |>   mutate(id = as.Date("2010-01-01") + day + year*365) ,
+  index =  id,
+  period = "month",
+  lookback = 24L,
+  assess_start = 1L,
+  assess_stop = 6L,
+  complete = TRUE,
+  step = 6L,
+  skip = 0L
+)
+
+folds |>
+ tidy() |> 
+ ggplot(aes(x = Resample, y = factor(Row), fill = Data)) +
+ geom_tile() +
+ labs(y = "Date") +
+ theme(
+   axis.text.y = element_blank(),
+   axis.ticks.y = element_blank()
+ )
+                  
+                                     
+```
+
+
+
+## Workflowset Ensemble
+
+```{r}
+#| label: workflowset
+#| warning: false
+#| message: false
+#| fig.width: 24
+
+
+logistic_reg_glmnet_spec <-
+  logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine('glmnet')
+
+pls_mixOmics_spec <-
+  pls(predictor_prop = tune(), num_comp = tune()) %>%
+  set_engine('mixOmics') %>%
+  set_mode('classification')
+
+brulee_spec <-
+  mlp(dropout = tune(), hidden_units = tune(), epochs = 1000L) %>%
+  set_engine('brulee', stop_iter = 50L, rate_schedule = "step")   %>%
+  set_mode('classification')     
+          
+
+dep_models <- 
+   workflow_set(
+      preproc = list(base = base_rec),
+      models = list(linear = logistic_reg_glmnet_spec,
+                    pls = pls_mixOmics_spec,
+                    brulee = brulee_spec),
+      cross = TRUE
+   ) %>% 
+  option_add_parameters() |> 
+  option_add(
+    control = finetune::control_sim_anneal(save_pred = TRUE,save_workflow = TRUE, verbose = TRUE, verbose_iter = TRUE),
+    metrics = metric_set(mn_log_loss)
+  )
+
+glm_params <- dep_models |> 
+    extract_workflow("base_linear") |> 
+  parameters() |> 
+  update(
+    mixture = mixture(),
+    penalty = dials::penalty(range = c(-2,0)))
+                  
+pls_params <- dep_models |>
+       extract_workflow("base_pls") |>       
+  parameters() |> 
+  update(
+    num_comp = num_comp(range = c(2L,4L)),
+    predictor_prop = predictor_prop(range = c(0.2,0.45)))
+
+brulee_params <- dep_models |>
+       extract_workflow("base_brulee") |>       
+  parameters() |> 
+  update(
+    hidden_units = hidden_units(range = c(20L, 40L)),
+    dropout = dropout(range = c(0.005,0.015)))       
+                   
+dep_models <- dep_models |> 
+  option_add(
+    param_info = glm_params,
+    id = "base_linear"
+  ) |> 
+  option_add(
+    param_info = pls_params,
+    id = "base_pls"
+  ) |> 
+  option_add(
+    param_info = brulee_params,
+    id = "base_brulee"
+  ) |> 
+   workflow_map("tune_sim_anneal", resamples = folds, iter = 50, 
+                metrics = metric_set(roc_auc), verbose = TRUE)
+
+rank_results(dep_models, rank_metric = "roc_auc", select_best = TRUE)                    
+
+autoplot(dep_models) +
+  geom_text(aes(y = mean -0.03, label= wflow_id), angle = 90, hjust = 1)+
+  theme(legend.position = "none")
+
+```
+
+## Hyperparameters and Feature Importance
+
+```{r }                   
+#| label: linear Details
+#| warning: false
+#| message: false    
+#| fig.height: 12               
+                   
+
+dep_models %>%
+  dplyr::filter(grepl("base_linear", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+
+dep_models |> 
+  workflowsets::extract_workflow_set_result("base_linear") |> 
+  autoplot() +
+  labs(title = "GLMNET Hyperparameter Search")
+
+best_linear_params <- dep_models |> 
+  workflowsets::extract_workflow_set_result("base_linear") |> 
+  select_best(metric = "roc_auc")  
+
+dep_models |> 
+  workflowsets::extract_workflow("base_linear") |> 
+  finalize_workflow(best_linear_params) |> 
+  fit(train_df) |> 
+  vip::vip(num_features = 50L)                   
+                                
+                   
+                   
+```
+
+                   
+
+```{r }                   
+#| label: pls Details
+#| warning: false
+#| message: false                    
+dep_models %>%
+  dplyr::filter(grepl("base_pls", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+
+dep_models |> 
+  workflowsets::extract_workflow_set_result("base_pls") |> 
+  autoplot() +
+  labs(title = "PLS Hyperparameter Search")                        
+                      
+                   
+```
+
+              
+
+```{r }                   
+#| label: brulee Details
+#| warning: false
+#| message: false                    
+dep_models %>%
+  dplyr::filter(grepl("base_brulee", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+
+dep_models |> 
+  workflowsets::extract_workflow_set_result("base_brulee") |> 
+  autoplot() +
+  labs(title = "Brulee Hyperparameter Search")   
+
+brulees <- dep_models |> 
+  dplyr::filter(grepl("base_brulee", wflow_id)) 
+
+                   
+```           
+
+## Ensemble            
+
+                   
+```{r }                   
+#| label: Ensemble Fit
+#| warning: false
+#| message: false 
+
+dep_stack <- stacks() %>%
+  add_candidates(dep_models) %>%
+  blend_predictions(  metric = metric_set(roc_auc),
+      penalty = c(10^seq(-2.5, -0.6, 0.1)),
+      non_negative = TRUE,
+      control = tune::control_grid(allow_par = TRUE))
+
+autoplot(dep_stack)
+
+autoplot(dep_stack, type = "members")  
+autoplot(dep_stack, type = "weights")
+
+classification_fit <- dep_stack %>% 
+    fit_members()
+
+```
+
+# Performance {.tabset .tabset-fade .tabset-pills}
+
+## DALEX
+
+```{r}
+#| label: explainer
+#| warning: false
+#| message: false
+
+
+explainer <- 
+  explain_tidymodels(
+    classification_fit, 
+    data = train_df %>% dplyr::select(all_of(features)), 
+    y = as.numeric(train_df$rainfall),
+    label = "Ensemble",
+    verbose = FALSE
+  )  %>% 
+  model_parts()
+
+ggplot_imp <- function(...) {
+  obj <- list(...)
+  metric_name <- attr(obj[[1]], "loss_name")
+  metric_lab <- paste(metric_name, 
+                      "after permutations\n(lower indicates more important)")
+  
+  full_vip <- bind_rows(obj) %>%
+    filter(variable != "_baseline_")
+  
+  perm_vals <- full_vip %>% 
+    filter(variable == "_full_model_") %>% 
+    group_by(label) %>% 
+    summarise(dropout_loss = mean(dropout_loss))
+  
+  p <- full_vip %>%
+    filter(variable != "_full_model_") %>% 
+    mutate(variable = fct_reorder(variable, -dropout_loss)) %>%
+    ggplot(aes(dropout_loss, variable)) 
+  
+  if(length(obj) > 1) {
+    p <- p + 
+      facet_wrap(vars(label)) +
+      geom_vline(data = perm_vals, aes(xintercept = dropout_loss, color = label),
+                 linewidth = 1.4, lty = 2, alpha = 0.7) +
+      geom_boxplot(aes(color = label, fill = label), alpha = 0.2)
+  } else {
+    p <- p + 
+      geom_vline(data = perm_vals, aes(xintercept = dropout_loss),
+                 linewidth = 1.4, lty = 2, alpha = 0.7) +
+      geom_boxplot(fill = "#91CBD765", alpha = 0.4)
+    
+  }
+  p +
+    theme(legend.position = "none") +
+    labs(x = metric_lab, 
+         y = NULL,  fill = NULL,  color = NULL)
+}
+                   
+ggplot_imp(explainer)      
+                   
+
+```                   
+
+## Submission
+```{r }                   
+#| label: submission
+#| warning: false
+#| message: false
+                   
+augment(classification_fit, train_df) %>% 
+  conf_mat(rainfall, .pred_class) %>%
+  yardstick:::autoplot.conf_mat(type = "heatmap")
+                   
+augment(classification_fit, train_df, type = "prob") %>%
+    yardstick::roc_curve(rainfall, .pred_0) |> 
+    ggplot(aes(1-specificity, sensitivity)) +
+    geom_line() +
+    geom_abline(slope = 1) +
+    coord_equal() 
+                   
+submit_df <-  augment(classification_fit , competition_df, type= "prob") %>%
+       transmute(id = round(id), rainfall = .pred_1)
+
+head(submit_df)  %>% 
+     knitr::kable()      
+
+submit_df  %>% 
+  write_csv("submission.csv")
+```  
